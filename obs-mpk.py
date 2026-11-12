@@ -11,7 +11,19 @@ start_note = 0
 def connect_to_device(a, b):
     global device
     global midi_device
+    # Close any previous connection first. Clicking Connect again used to open
+    # an extra port each time, so every pad press switched the scene once per
+    # open port and restarted the transition.
+    disconnect_from_device(None, None)
     device = mido.open_input(midi_device, callback=midi_update)
+
+def current_scene_name():
+    current = obs.obs_frontend_get_current_scene()
+    if current is None:
+        return None
+    name = obs.obs_source_get_name(current)
+    obs.obs_source_release(current)
+    return name
 
 def midi_update(msg):
     global audio_source 
@@ -25,12 +37,16 @@ def midi_update(msg):
                 volume = float(msg.value) / 127.0
                 obs.obs_source_set_volume(audio, volume)
             obs.obs_source_release(audio)
-    elif (msg.type == "note_on"):
+    elif (msg.type == "note_on" and msg.velocity > 0):  # velocity 0 is a note release
         index = msg.note - start_note
         if (index < len(scene_sources) and index >= 0):
+            # Already on this scene: do nothing, so the transition isn't restarted.
+            if scene_sources[index] == current_scene_name():
+                return
             scene = obs.obs_get_source_by_name(scene_sources[index])
-            obs.obs_frontend_set_current_scene(scene)
-            obs.obs_source_release(scene)
+            if scene is not None:
+                obs.obs_frontend_set_current_scene(scene)
+                obs.obs_source_release(scene)
 
 
 
