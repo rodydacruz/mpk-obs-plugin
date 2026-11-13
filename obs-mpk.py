@@ -6,7 +6,15 @@ midi_device = ""
 device = None
 audio_source = []
 scene_sources = []
+opacity_sources = []
 start_note = 0
+
+# Knobs after the audio ones fade video sources through a Color Correction
+# filter with this name, added to the source the first time its knob moves.
+OPACITY_FILTER = "MPK Opacity"
+# Sources this script hid (knob at 0), so turning the knob up only re-shows
+# what the knob hid and never a source you hid by hand.
+hidden_by_knob = set()
 
 def connect_to_device(a, b):
     global device
@@ -25,18 +33,58 @@ def current_scene_name():
     obs.obs_source_release(current)
     return name
 
+def set_source_visible(name, visible):
+    # Show/hide the source in every scene that contains it.
+    if visible and name not in hidden_by_knob:
+        return
+    if not visible and name in hidden_by_knob:
+        return
+    scenes = obs.obs_frontend_get_scenes()
+    for scene_source in scenes:
+        scene = obs.obs_scene_from_source(scene_source)
+        item = obs.obs_scene_find_source(scene, name)
+        if item is not None:
+            obs.obs_sceneitem_set_visible(item, visible)
+    obs.source_list_release(scenes)
+    if visible:
+        hidden_by_knob.discard(name)
+    else:
+        hidden_by_knob.add(name)
+
+def set_source_opacity(name, value):
+    source = obs.obs_get_source_by_name(name)
+    if source is None:
+        return
+    settings = obs.obs_data_create()
+    obs.obs_data_set_double(settings, "opacity", value / 127.0)  # color_filter_v2: 0.0-1.0
+    opacity_filter = obs.obs_source_get_filter_by_name(source, OPACITY_FILTER)
+    if opacity_filter is None:
+        opacity_filter = obs.obs_source_create_private("color_filter_v2", OPACITY_FILTER, settings)
+        obs.obs_source_filter_add(source, opacity_filter)
+    else:
+        obs.obs_source_update(opacity_filter, settings)
+    obs.obs_source_release(opacity_filter)
+    obs.obs_data_release(settings)
+    obs.obs_source_release(source)
+    # Knob all the way down hides the source; any other position shows it.
+    set_source_visible(name, value > 0)
+
 def midi_update(msg):
-    global audio_source 
+    global audio_source
     global start_note
     global scene_sources
     if (msg.type == "control_change"):
-        if (msg.control - 1) < len(audio_source):
-            audio_device = audio_source[msg.control - 1]
-            audio = obs.obs_get_source_by_name(audio_device)
+        # K1..Kn -> audio volume (one per Audio Sources entry),
+        # the following knobs -> opacity of the Opacity Sources entries.
+        index = msg.control - 1
+        if 0 <= index < len(audio_source):
+            audio = obs.obs_get_source_by_name(audio_source[index])
             if audio is not None:
                 volume = float(msg.value) / 127.0
                 obs.obs_source_set_volume(audio, volume)
-            obs.obs_source_release(audio)
+                obs.obs_source_release(audio)
+        elif 0 <= index - len(audio_source) < len(opacity_sources):
+            set_source_opacity(opacity_sources[index - len(audio_source)], msg.value)
     elif (msg.type == "note_on" and msg.velocity > 0):  # velocity 0 is a note release
         index = msg.note - start_note
         if (index < len(scene_sources) and index >= 0):
@@ -76,6 +124,7 @@ def script_properties():
     obs.obs_properties_add_button(props, "disconnect", "Disconnect", disconnect_from_device)
     obs.obs_properties_add_text(props, "audio-sources", "Audio Sources", obs.OBS_TEXT_MULTILINE)
     obs.obs_properties_add_text(props, "scene-sources", "Scene Sources", obs.OBS_TEXT_MULTILINE)
+    obs.obs_properties_add_text(props, "opacity-sources", "Opacity Sources (knobs after audio)", obs.OBS_TEXT_MULTILINE)
 
     obs.obs_properties_add_int(props, "start-note", "Scene select start note", 0, 108, 1) 
     return props
@@ -91,6 +140,7 @@ def script_update(settings):
     global midi_device
     global audio_source
     global scene_sources
+    global opacity_sources
     global start_note
     midi_device = obs.obs_data_get_string(settings, "source")
     start_note = obs.obs_data_get_int(settings, "start-note")
@@ -100,3 +150,6 @@ def script_update(settings):
     scene_sources_text = obs.obs_data_get_string(settings, "scene-sources")
     if value_is_json(scene_sources_text):
         scene_sources = json.loads(scene_sources_text)
+    opacity_sources_text = obs.obs_data_get_string(settings, "opacity-sources")
+    if value_is_json(opacity_sources_text):
+        opacity_sources = json.loads(opacity_sources_text)
