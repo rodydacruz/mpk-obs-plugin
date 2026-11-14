@@ -1,18 +1,33 @@
 import mido
 import obspython as obs
 import json
+import threading
 import time
+from collections import deque
+
+# Threading model (why OBS no longer freezes):
+#   * The MIDI callback runs on python-rtmidi's thread. It only records the
+#     message and wakes the worker; it never calls into OBS.
+#   * One worker thread applies the changes. Fast knob turns are merged (only
+#     the latest value per knob is applied, at most ~60 times a second) and
+#     repeated values are skipped.
+#   * The script registers no OBS frontend/event callbacks. A scene switch
+#     makes the worker wait for OBS's UI thread while holding Python's lock;
+#     a Python event callback on the UI thread at that moment would need the
+#     same lock and both would wait forever (this froze OBS before).
+#   * Nothing runs on OBS's video thread (no obs.timer_add).
 
 midi_device = ""
 device = None
+device_lock = threading.Lock()
 start_note = 0
 
-# Manual lists, used only when "Detect automatically" is off.
+# Manual lists, used only when "Use the manual lists" is ticked.
 audio_source = []
 scene_sources = []
 opacity_sources = []
 
-# With "Detect automatically" on (the default), the script reads OBS itself:
+# Automatic mode (the default) reads OBS itself:
 #   audio  -> the global audio devices (Desktop Audio, Mic/Aux...) -> first knobs
 #   video  -> every video source used in your scenes               -> remaining knobs
 #   scenes -> all scenes, in the order of the Scenes dock           -> pads
@@ -29,6 +44,23 @@ OPACITY_FILTER = "MPK Opacity"
 hidden_by_knob = set()
 # Knob/controller CC numbers already reported as unmapped in the script log.
 unmapped_logged = set()
+# Last value applied per target, to skip repeats.
+_applied = {}
+
+# The script connects by itself: on load, when the selected device changes,
+# and every few seconds while the MPK is missing (not plugged in yet, or
+# unplugged). Pressing Disconnect pauses this until Connect is pressed.
+RECONNECT_SECONDS = 3.0
+MAX_UPDATES_PER_SECOND = 60
+user_disconnected = False
+
+# Work handed from the MIDI thread to the worker
+_pending_cc = {}          # control number -> latest mido message
+_pending_notes = deque()  # pad notes, in order
+_wake = threading.Event()
+_stop = threading.Event()
+_reconnect_now = threading.Event()
+_worker = None
 
 
 # --- Detection -------------------------------------------------------------
@@ -85,26 +117,17 @@ def mappings():
     return _detected["scenes"], _detected["audio"], _detected["video"]
 
 def mapping_text():
-    scenes, audio, video = mappings() if not auto_detect else (_detected["scenes"], _detected["audio"], _detected["video"])
+    if auto_detect:
+        scenes, audio, video = _detected["scenes"], _detected["audio"], _detected["video"]
+    else:
+        scenes, audio, video = mappings()
     knobs = ["K%d volume: %s" % (i + 1, n) for i, n in enumerate(audio)]
     knobs += ["K%d opacity: %s" % (len(audio) + i + 1, n) for i, n in enumerate(video)]
     pads = ["%d: %s" % (start_note + i, n) for i, n in enumerate(scenes)]
     return "Knobs\n  " + ("\n  ".join(knobs) or "(none)") + "\nPads (note: scene)\n  " + ("\n  ".join(pads) or "(none)")
 
-def on_frontend_event(event):
-    if event in (obs.OBS_FRONTEND_EVENT_FINISHED_LOADING,
-                 obs.OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED,
-                 obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED):
-        _detected["time"] = 0.0  # re-detect on the next MIDI message
 
-
-# --- MIDI ------------------------------------------------------------------
-
-# The script connects by itself: on load, when the selected device changes,
-# and every few seconds while the MPK is missing (not plugged in yet, or
-# unplugged). Pressing Disconnect pauses this until Connect is pressed.
-RECONNECT_MS = 3000
-user_disconnected = False
+# --- MIDI connection ---------------------------------------------------------
 
 def pick_device(names):
     if midi_device in names:
@@ -118,25 +141,26 @@ def pick_device(names):
 
 def ensure_connected():
     global device
-    if user_disconnected:
-        return
-    names = mido.get_input_names()
-    if device is not None:
-        if device.name in names:
+    with device_lock:
+        if user_disconnected:
             return
-        print("MIDI device '%s' is gone, waiting for it to come back" % device.name)
-        close_device()
-    name = pick_device(names)
-    if name is None:
-        return
-    try:
-        device = mido.open_input(name, callback=midi_update)
-        print("Connected to '%s'" % name)
-    except Exception as e:  # e.g. the port is busy in another program
-        device = None
-        print("Could not open '%s': %s" % (name, e))
+        names = mido.get_input_names()
+        if device is not None:
+            if device.name in names:
+                return
+            print("MIDI device '%s' is gone, waiting for it to come back" % device.name)
+            _close_device_locked()
+        name = pick_device(names)
+        if name is None:
+            return
+        try:
+            device = mido.open_input(name, callback=on_midi)
+            print("Connected to '%s'" % name)
+        except Exception as e:  # e.g. the port is busy in another program
+            device = None
+            print("Could not open '%s': %s" % (name, e))
 
-def close_device():
+def _close_device_locked():
     global device
     # Always close the previous port before opening another: an extra open
     # port made every pad press switch the scene once per port.
@@ -145,11 +169,16 @@ def close_device():
         device.close()
         device = None
 
+def close_device():
+    with device_lock:
+        _close_device_locked()
+
 def connect_to_device(a=None, b=None):
     global user_disconnected
     user_disconnected = False
     close_device()
-    ensure_connected()
+    _reconnect_now.set()   # the worker opens it (keeps the UI thread free)
+    _wake.set()
 
 def disconnect_from_device(a=None, b=None):
     global user_disconnected
@@ -157,6 +186,20 @@ def disconnect_from_device(a=None, b=None):
     if device is not None:
         print("Disconnected from '%s'" % device.name)
     close_device()
+
+
+# --- MIDI thread: record only ------------------------------------------------
+
+def on_midi(msg):
+    if msg.type == "control_change":
+        _pending_cc[msg.control] = msg      # keep only the latest value per knob
+        _wake.set()
+    elif msg.type == "note_on" and msg.velocity > 0:  # velocity 0 is a note release
+        _pending_notes.append(msg.note)
+        _wake.set()
+
+
+# --- Worker thread: apply ----------------------------------------------------
 
 def current_scene_name():
     current = obs.obs_frontend_get_current_scene()
@@ -166,25 +209,24 @@ def current_scene_name():
     obs.obs_source_release(current)
     return name
 
-def set_source_visible(name, visible):
+def set_source_visible(name, visible, scenes):
     # Show/hide the source in every scene that contains it.
-    if visible and name not in hidden_by_knob:
+    if visible == (name not in hidden_by_knob):
         return
-    if not visible and name in hidden_by_knob:
-        return
-    scenes = obs.obs_frontend_get_scenes()
-    for scene_source in scenes:
-        scene = obs.obs_scene_from_source(scene_source)
-        item = obs.obs_scene_find_source(scene, name)
+    for scene_name in scenes:
+        scene_source = obs.obs_get_source_by_name(scene_name)
+        if scene_source is None:
+            continue
+        item = obs.obs_scene_find_source(obs.obs_scene_from_source(scene_source), name)
         if item is not None:
             obs.obs_sceneitem_set_visible(item, visible)
-    obs.source_list_release(scenes)
+        obs.obs_source_release(scene_source)
     if visible:
         hidden_by_knob.discard(name)
     else:
         hidden_by_knob.add(name)
 
-def set_source_opacity(name, value):
+def set_source_opacity(name, value, scenes):
     source = obs.obs_get_source_by_name(name)
     if source is None:
         return
@@ -200,35 +242,89 @@ def set_source_opacity(name, value):
     obs.obs_data_release(settings)
     obs.obs_source_release(source)
     # Knob all the way down hides the source; any other position shows it.
-    set_source_visible(name, value > 0)
+    set_source_visible(name, value > 0, scenes)
 
-def midi_update(msg):
+def handle_cc(msg, scenes, audio, video):
+    # First knobs -> audio volume, the following knobs -> video opacity.
+    index = msg.control - 1
+    if 0 <= index < len(audio):
+        name = audio[index]
+        if _applied.get(("volume", name)) == msg.value:
+            return
+        source = obs.obs_get_source_by_name(name)
+        if source is not None:
+            obs.obs_source_set_volume(source, float(msg.value) / 127.0)
+            obs.obs_source_release(source)
+            _applied[("volume", name)] = msg.value
+    elif 0 <= index - len(audio) < len(video):
+        name = video[index - len(audio)]
+        if _applied.get(("opacity", name)) == msg.value:
+            return
+        set_source_opacity(name, msg.value, scenes)
+        _applied[("opacity", name)] = msg.value
+    elif msg.control not in unmapped_logged:
+        # Logged once per control so the script log shows what the MPK sends.
+        unmapped_logged.add(msg.control)
+        print("CC %d (channel %d) has nothing mapped: %d volume knob(s), %d opacity knob(s)"
+              % (msg.control, msg.channel + 1, len(audio), len(video)))
+
+def handle_pad(note, scenes):
+    index = note - start_note
+    if not 0 <= index < len(scenes):
+        return
+    # Already on this scene: do nothing, so the transition isn't restarted.
+    if scenes[index] == current_scene_name():
+        return
+    scene = obs.obs_get_source_by_name(scenes[index])
+    if scene is not None:
+        obs.obs_frontend_set_current_scene(scene)
+        obs.obs_source_release(scene)
+
+def process_pending():
+    if not _pending_cc and not _pending_notes:
+        return
     scenes, audio, video = mappings()
-    if (msg.type == "control_change"):
-        # First knobs -> audio volume, the following knobs -> video opacity.
-        index = msg.control - 1
-        if 0 <= index < len(audio):
-            source = obs.obs_get_source_by_name(audio[index])
-            if source is not None:
-                obs.obs_source_set_volume(source, float(msg.value) / 127.0)
-                obs.obs_source_release(source)
-        elif 0 <= index - len(audio) < len(video):
-            set_source_opacity(video[index - len(audio)], msg.value)
-        elif msg.control not in unmapped_logged:
-            # Logged once per control so the script log shows what the MPK sends.
-            unmapped_logged.add(msg.control)
-            print("CC %d (channel %d) has nothing mapped: %d volume knob(s), %d opacity knob(s)"
-                  % (msg.control, msg.channel + 1, len(audio), len(video)))
-    elif (msg.type == "note_on" and msg.velocity > 0):  # velocity 0 is a note release
-        index = msg.note - start_note
-        if 0 <= index < len(scenes):
-            # Already on this scene: do nothing, so the transition isn't restarted.
-            if scenes[index] == current_scene_name():
-                return
-            scene = obs.obs_get_source_by_name(scenes[index])
-            if scene is not None:
-                obs.obs_frontend_set_current_scene(scene)
-                obs.obs_source_release(scene)
+    # Several pad hits since the last pass: only the last one matters, so we
+    # don't run a transition through every scene in between.
+    last_note = None
+    while _pending_notes:
+        last_note = _pending_notes.popleft()
+    if last_note is not None:
+        handle_pad(last_note, scenes)
+    for control in list(_pending_cc):
+        msg = _pending_cc.pop(control, None)
+        if msg is not None:
+            handle_cc(msg, scenes, audio, video)
+
+def worker_loop():
+    next_connect_check = 0.0
+    while not _stop.is_set():
+        _wake.wait(0.5)
+        _wake.clear()
+        if _stop.is_set():
+            break
+        try:
+            now = time.monotonic()
+            if _reconnect_now.is_set() or now >= next_connect_check:
+                _reconnect_now.clear()
+                ensure_connected()
+                next_connect_check = now + RECONNECT_SECONDS
+            process_pending()
+        except Exception as e:
+            print("obs-mpk worker error: %r" % (e,))
+        _stop.wait(1.0 / MAX_UPDATES_PER_SECOND)  # merge bursts of knob messages
+
+def start_worker():
+    global _worker
+    _stop.clear()
+    _worker = threading.Thread(target=worker_loop, name="obs-mpk", daemon=True)
+    _worker.start()
+
+def stop_worker():
+    _stop.set()
+    _wake.set()
+    if _worker is not None:
+        _worker.join(timeout=2.0)
 
 
 # --- OBS script hooks --------------------------------------------------------
@@ -239,12 +335,10 @@ def script_description():
             "(all the way down hides it). Pads: switch scenes.")
 
 def script_load(settings):
-    obs.obs_frontend_add_event_callback(on_frontend_event)
-    ensure_connected()
-    obs.timer_add(ensure_connected, RECONNECT_MS)
+    start_worker()
 
 def script_unload():
-    obs.timer_remove(ensure_connected)
+    stop_worker()
     close_device()
 
 def refresh_clicked(props, prop):
@@ -295,16 +389,17 @@ def script_update(settings):
     selected = obs.obs_data_get_string(settings, "source")
     if selected != midi_device:
         midi_device = selected
-        # A different MPK/port was picked: drop the current one, the reconnect
-        # timer (or the call below) opens the new choice.
-        if device is not None and device.name != midi_device and midi_device in mido.get_input_names():
+        # A different MPK/port was picked: drop the current one and let the
+        # worker open the new choice.
+        if device is not None and device.name != midi_device:
             close_device()
-            ensure_connected()
+        _reconnect_now.set()
+        _wake.set()
     start_note = obs.obs_data_get_int(settings, "start-note")
-    # Automatic unless the manual box is ticked (an unset bool reads as False,
-    # so this works without relying on script_defaults).
+    # Automatic unless the manual box is ticked (an unset bool reads as False).
     auto_detect = not obs.obs_data_get_bool(settings, "manual-mapping")
     _detected["time"] = 0.0
+    _applied.clear()
     audio_sources_text = obs.obs_data_get_string(settings, "audio-sources")
     if value_is_json(audio_sources_text):
         audio_source = json.loads(audio_sources_text)
@@ -314,6 +409,3 @@ def script_update(settings):
     opacity_sources_text = obs.obs_data_get_string(settings, "opacity-sources")
     if value_is_json(opacity_sources_text):
         opacity_sources = json.loads(opacity_sources_text)
-    if auto_detect:
-        refresh_detection(quiet=True)
-    print(("Automatic mapping:\n" if auto_detect else "Manual mapping:\n") + mapping_text())
